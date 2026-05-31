@@ -1623,6 +1623,40 @@ fn inject_controller(filter: TargetFilter, controller: ControllerRef) -> TargetF
     }
 }
 
+/// Scope of a distributive ETB-with-counters subject (CR 614.12). `Other`
+/// excludes the source (`FilterProp::Another`); `Distributive` is a general
+/// subset that includes the source if it matches the type filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectScope {
+    /// "each other [type] ..." / "other [type] ..." — excludes the source.
+    Other,
+    /// "each [type] ..." — general subset including the source per CR 614.12.
+    Distributive,
+}
+
+/// Strip a distributive subject prefix from an ETB-with-counters line, reporting
+/// whether the source is excluded (`Other`) or included (`Distributive`).
+///
+/// CR 614.12: a replacement that modifies how a permanent enters may affect
+/// "only that permanent" or "a general subset of permanents that includes it".
+/// The "each other "/"other " forms exclude the source; the bare "each " form
+/// is a general subset that includes it. Returns `None` for self-ETB lines
+/// ("~ enters with ..."), which fall through to `SelfRef`.
+///
+/// The `"each other "` alternative must precede `"each "` so the longer match
+/// wins; `alt` is order-sensitive and `"each "` would otherwise shadow it.
+fn parse_distributive_subject(work_text: &str) -> Option<(&str, SubjectScope)> {
+    alt((
+        value(
+            SubjectScope::Other,
+            alt((tag::<_, _, OracleError<'_>>("each other "), tag("other "))),
+        ),
+        value(SubjectScope::Distributive, tag("each ")),
+    ))
+    .parse(work_text)
+    .ok()
+}
+
 /// Extract life payment amount from "pay N life" pattern.
 fn extract_life_payment(text: &str) -> Option<i32> {
     let after_pay = strip_after(text, "pay ")?;
@@ -1837,39 +1871,47 @@ fn parse_enters_with_counters(
         put_counter
     };
 
-    // Determine valid_card filter: self vs other permanents.
-    // CR 614.1c: "each other Angel you control enters with ..." is a
-    // replacement effect that applies to a general subset of permanents, not
-    // the source. Strip the "each other " / "other " prefix (nom), then let
-    // `parse_type_phrase` be the detector: accept the subject iff the parse
-    // yields a typed filter with a concrete type/subtype (not the `Any`
-    // fallback). `parse_type_phrase` already classifies "creature",
-    // "permanent", AND subtypes ("Angel", "Sliver", ...) — so subtype-only
-    // subjects are no longer rejected by a hardcoded "creature"/"permanent"
-    // keyword guard. A non-type subject parses to the `[Any]` fallback and is
+    // Determine valid_card filter: self vs a general subset of permanents.
+    // CR 614.1c: Effects that read "[permanent] enters with ..." are
+    // replacement effects. CR 614.12 distinguishes effects that affect "only
+    // that permanent" (self-ETB → SelfRef) from those affecting "a general
+    // subset of permanents that includes it" (distributive → typed filter).
+    //
+    // Two distributive shapes exist:
+    //   - "each other [type] you control enters with ..." (Giada) — explicitly
+    //     EXCLUDES the source, so `FilterProp::Another` must be injected.
+    //   - "each [type] you control enters with ..." (Dragonstorm Globe) — the
+    //     general subset INCLUDES the source if it matches the type; per
+    //     CR 614.12 the subset "includes it", so NO `Another` is injected. (The
+    //     artifact source simply doesn't match a Dragon type filter, so no
+    //     self-application occurs here — but the class must not exclude itself.)
+    //
+    // `parse_distributive_subject` strips the prefix and reports the scope, then
+    // `parse_type_phrase` acts as the type detector: accept the subject iff the
+    // parse yields a typed filter with a concrete type/subtype (not the `Any`
+    // fallback). A non-type subject parses to the `[Any]` fallback and is
     // rejected, falling through to the `SelfRef` self-ETB branch.
-    let subject = alt((tag::<_, _, OracleError<'_>>("each other "), tag("other ")))
-        .parse(work_text)
-        .ok()
-        .map(|(rest, _)| rest)
-        .filter(|s| {
-            let (filter, _) = parse_type_phrase(s);
-            matches!(
-                &filter,
-                TargetFilter::Typed(TypedFilter { type_filters, .. })
-                    if !type_filters.is_empty()
-                        && type_filters.as_slice() != [TypeFilter::Any]
-            )
-        });
-    let valid_card = if let Some(subject_text) = subject {
+    let subject = parse_distributive_subject(work_text).and_then(|(subject_text, scope)| {
         let (filter, _) = parse_type_phrase(subject_text);
-        // Inject Another since we stripped "other" above
-        let filter = match filter {
-            TargetFilter::Typed(TypedFilter {
-                type_filters,
-                controller,
-                mut properties,
-            }) => {
+        let is_valid = matches!(
+            &filter,
+            TargetFilter::Typed(TypedFilter { type_filters, .. })
+                if !type_filters.is_empty()
+                    && type_filters.as_slice() != [TypeFilter::Any]
+        );
+        is_valid.then_some((filter, scope))
+    });
+    let valid_card = if let Some((filter, scope)) = subject {
+        // CR 614.12: only the "other" scope excludes the source from the subset.
+        let filter = match (filter, scope) {
+            (
+                TargetFilter::Typed(TypedFilter {
+                    type_filters,
+                    controller,
+                    mut properties,
+                }),
+                SubjectScope::Other,
+            ) => {
                 properties.insert(0, FilterProp::Another);
                 TargetFilter::Typed(TypedFilter {
                     type_filters,
@@ -1877,7 +1919,7 @@ fn parse_enters_with_counters(
                     properties,
                 })
             }
-            other => other,
+            (other, _) => other,
         };
         Some(filter)
     } else {
@@ -3489,14 +3531,33 @@ fn damage_target_opponent_or_permanents() -> DamageTargetFilter {
     }
 }
 
+fn damage_target_source_chosen_player_or_permanents() -> DamageTargetFilter {
+    DamageTargetFilter::PlayerOrPermanentsControlledBy {
+        player: DamageTargetPlayerScope::SourceChosenPlayer,
+    }
+}
+
 /// Nom combinator for damage target phrases. Most specific tags first.
 fn parse_damage_target_phrase(
     input: &str,
 ) -> nom::IResult<&str, DamageTargetFilter, OracleError<'_>> {
     alt((
         value(
+            damage_target_source_chosen_player_or_permanents(),
+            alt((
+                tag("to the chosen player or a permanent they control"),
+                tag("to the chosen player or a permanent the chosen player controls"),
+            )),
+        ),
+        value(
             damage_target_opponent_or_permanents(),
             tag("to an opponent or a permanent an opponent controls"),
+        ),
+        value(
+            DamageTargetFilter::Player {
+                player: DamageTargetPlayerScope::SourceChosenPlayer,
+            },
+            tag("to the chosen player"),
         ),
         value(
             DamageTargetFilter::CreatureOnly,
@@ -4770,6 +4831,12 @@ fn parse_damage_prevention_replacement(
     if let Some(sf) = damage_source_filter {
         def = def.damage_source_filter(sf);
     }
+    // Capture whether the recipient filter was event-driven (typed
+    // `valid_card`) before moving it onto `def` — the follow-up rewrite
+    // below uses this signal to distinguish the Vigor cohort (rewrite
+    // `ParentTarget` → `PostReplacementDamageTarget`) from the spell-driven
+    // cohort (keep `ParentTarget` for the real spell target).
+    let recipient_is_event_filter = valid_card_filter.is_some();
     if let Some(vc) = valid_card_filter {
         def = def.valid_card(vc);
     }
@@ -4785,14 +4852,29 @@ fn parse_damage_prevention_replacement(
     // consumes the damage. Class members: Phyrexian Hydra, Vigor, Stormwild
     // Capridor, Hostility.
     if let Some(followup) = extract_prevention_followup(original_text) {
-        // CR 608.2k: Static self-prevention replacements (Anti-Venom, Vigor,
-        // Phyrexian Hydra, Stormwild Capridor) host their followup on the
-        // shield-bearing permanent itself. Bare pronouns ("him"/"it"/"this
-        // creature"/"this enchantment") in the rider must bind to `SelfRef`
-        // so PutCounter targets the permanent, not a non-existent parent
-        // target. The rider parse runs through the standard chain pipeline
-        // with `subject: SelfRef` so `resolve_pronoun_target` returns
-        // `SelfRef` per its typed-subject carve-out.
+        // CR 608.2k: Static self-prevention replacements split into two
+        // anaphor cohorts depending on what the rider counter/effect targets:
+        //
+        // 1. Rider targets the shield-bearing permanent itself (Anti-Venom,
+        //    Phyrexian Hydra, Stormwild Capridor, Hostility). The rider's
+        //    bare pronouns ("him"/"it"/"this creature"/"this enchantment"/
+        //    "~") must bind to `SelfRef` so the counter lands on the source.
+        //    Threading `subject: SelfRef` makes `resolve_pronoun_target`
+        //    return `SelfRef` per its typed-subject carve-out.
+        //
+        // 2. Rider targets the prevented event's damage recipient (Vigor:
+        //    "If damage would be dealt to another creature you control,
+        //    prevent that damage. Put a +1/+1 counter on that creature ..."
+        //    — "that creature" is the recipient, not the source). The rider
+        //    parser lowers "that creature" to `TargetFilter::ParentTarget`
+        //    by the generic CR 608.2c anaphor path, but there is no parent
+        //    target slot in a passive replacement context, so the binding
+        //    is dangling. Post-parse rewrite (below) remaps it to
+        //    `PostReplacementDamageTarget`. Cohort 2 is detected by the
+        //    presence of a typed `valid_card` recipient filter — that's the
+        //    structural signal that the shield is event-driven (no spell
+        //    target), so any `ParentTarget` in the rider can only refer to
+        //    the event recipient.
         let mut followup_ctx = ParseContext {
             subject: Some(TargetFilter::SelfRef),
             in_replacement: true,
@@ -4810,12 +4892,35 @@ fn parse_damage_prevention_replacement(
         // avoids parser-context plumbing. Single building-block walker
         // (`each_target_filter_mut`) handles every target-bearing effect arm.
         rewrite_parent_target_controller_to_post_replacement_source(&mut followup_def);
+        // CR 615.5 + CR 608.2c: Object-anaphor rewrite for cohort 2 (Vigor
+        // class). When the shield is event-driven (signalled by a typed
+        // `valid_card_filter`), `ParentTarget` in the rider can only refer
+        // to the prevented event's damage recipient — there is no parent
+        // target slot. Remap dangling `ParentTarget` to
+        // `PostReplacementDamageTarget` so the runtime resolves it against
+        // `state.post_replacement_event_target`. Spell-driven prevention
+        // (Test of Faith — "prevent the next 3 damage that would be dealt to
+        // target creature this turn") has `valid_card_filter = None` because
+        // its all-consuming recipient terminator fails, so this rewrite
+        // does not fire and `ParentTarget` correctly inherits the spell's
+        // chosen target.
+        if recipient_is_event_filter {
+            rewrite_parent_target_to_post_replacement_damage_target(&mut followup_def);
+        }
         def = def.execute(followup_def);
     }
 
     Some(def)
 }
 
+/// CR 614.1a: Extract the typed event-recipient filter from a damage-prevention
+/// shield's "dealt to <filter>" clause. The clause may close at the end of the
+/// sentence (`.`, `this turn`, `until end of turn`, or input end) or continue
+/// into a sibling prevention imperative (`, prevent that damage. ...` — Vigor,
+/// Phyrexian Hydra, Stormwild Capridor class of static prevention shields with
+/// follow-up rider). The `peek(", prevent")` boundary keeps the filter scoped
+/// to the recipient phrase without consuming the comma + imperative, leaving
+/// the follow-up extractor (`extract_prevention_followup`) to claim it.
 fn parse_damage_recipient_valid_card_filter(working_lower: &str) -> Option<TargetFilter> {
     nom_primitives::scan_at_word_boundaries(working_lower, |input| {
         let (after_to, _) = tag::<_, _, OracleError<'_>>("dealt to ").parse(input)?;
@@ -4828,7 +4933,7 @@ fn parse_damage_recipient_valid_card_filter(working_lower: &str) -> Option<Targe
         }
 
         let rest = rest.trim_start();
-        if all_consuming(alt((
+        let fully_consumed = all_consuming(alt((
             value((), eof::<&str, OracleError<'_>>),
             value((), tag::<_, _, OracleError<'_>>(".")),
             value(
@@ -4847,8 +4952,16 @@ fn parse_damage_recipient_valid_card_filter(working_lower: &str) -> Option<Targe
             ),
         )))
         .parse(rest)
-        .is_ok()
-        {
+        .is_ok();
+        // CR 614.1a + CR 615.5: A static prevention shield with a same-sentence
+        // imperative ("if damage would be dealt to <filter>, prevent that damage")
+        // closes the recipient phrase at the clause boundary `, prevent`, not at
+        // sentence end. `peek` acknowledges the boundary without consuming so
+        // the follow-up extractor still claims the imperative and its rider.
+        let clause_boundary = peek(tag::<_, _, OracleError<'_>>(", prevent"))
+            .parse(rest)
+            .is_ok();
+        if fully_consumed || clause_boundary {
             Ok((rest, filter))
         } else {
             Err(nom::Err::Error(OracleError::new(
@@ -4874,6 +4987,37 @@ fn rewrite_parent_target_controller_to_post_replacement_source(def: &mut Ability
     }
     if let Some(else_branch) = def.else_ability.as_mut() {
         rewrite_parent_target_controller_to_post_replacement_source(else_branch);
+    }
+}
+
+/// CR 615.5 + CR 608.2c: In a prevention follow-up whose shield is event-driven
+/// (Vigor class: "If damage would be dealt to <typed filter>, prevent that
+/// damage. Put a +1/+1 counter on that creature ..."), the rider's anaphor
+/// "that creature" refers to the prevented event's damage recipient. The
+/// ordinary `parse_target` path lowers "that <type phrase>" to
+/// `TargetFilter::ParentTarget` per CR 608.2c, but in a passive replacement
+/// there is no parent target slot to bind against. Rewrite each dangling
+/// `ParentTarget` to `PostReplacementDamageTarget` so the runtime resolves
+/// it against `state.post_replacement_event_target`.
+///
+/// Sibling of `rewrite_damage_recipient_to_post_replacement_target` which
+/// handles the player-anaphor cohort ("that player draws cards ..."). Kept
+/// separate so the player walker stays scoped to player refs and this walker
+/// only fires when the caller has confirmed the shield is event-driven (via
+/// a typed `valid_card_filter` signal) — spell-driven prevention with a real
+/// `target creature` slot must keep its `ParentTarget` binding intact (Test
+/// of Faith).
+fn rewrite_parent_target_to_post_replacement_damage_target(def: &mut AbilityDefinition) {
+    super::oracle_effect::each_target_filter_mut(&mut def.effect, &mut |f| {
+        if matches!(f, TargetFilter::ParentTarget) {
+            *f = TargetFilter::PostReplacementDamageTarget;
+        }
+    });
+    if let Some(sub) = def.sub_ability.as_mut() {
+        rewrite_parent_target_to_post_replacement_damage_target(sub);
+    }
+    if let Some(else_branch) = def.else_ability.as_mut() {
+        rewrite_parent_target_to_post_replacement_damage_target(else_branch);
     }
 }
 
@@ -5748,6 +5892,95 @@ mod tests {
                 target: TargetFilter::ParentTarget,
             } if *counter_type == CounterType::Plus1Plus1
         ));
+    }
+
+    /// CR 614.1a + CR 615.5 + CR 608.2c: Vigor — "If damage would be dealt to
+    /// another creature you control, prevent that damage. Put a +1/+1 counter
+    /// on that creature for each 1 damage prevented this way."
+    ///
+    /// Three building-block assertions:
+    ///
+    /// 1. The recipient phrase parses through `parse_damage_recipient_valid_card_filter`
+    ///    even though it closes at `", prevent"` (the same-sentence clause
+    ///    boundary), and the resulting typed filter retains `controller: You`
+    ///    and `FilterProp::Another`. Previously the all-consuming terminator
+    ///    rejected the comma + imperative, silently dropping `valid_card` and
+    ///    causing the shield to fire on ANY creature (including opponents').
+    ///
+    /// 2. The rider's anaphor "that creature" (which `parse_target` lowers to
+    ///    `TargetFilter::ParentTarget` per CR 608.2c) is rewritten at the
+    ///    parser call site to `TargetFilter::PostReplacementDamageTarget` so
+    ///    the +1/+1 counter lands on the prevented event's damage recipient
+    ///    rather than dangling against a nonexistent parent target slot.
+    ///
+    /// 3. The rider count resolves to `QuantityRef::EventContextAmount` (the
+    ///    prevented amount), via the existing `for each 1 damage prevented
+    ///    this way` post-target suffix path.
+
+    #[test]
+    fn vigor_event_recipient_filter_and_counter_target_rewrite() {
+        let def = parse_replacement_line(
+            "If damage would be dealt to another creature you control, prevent that damage. \
+             Put a +1/+1 counter on that creature for each 1 damage prevented this way.",
+            "Vigor",
+        )
+        .expect("Vigor should parse as a damage prevention replacement");
+
+        // (1) valid_card recipient filter — Typed Creature, controller=You, Another.
+        let valid_card = def
+            .valid_card
+            .as_ref()
+            .expect("Vigor's recipient filter must survive the parser");
+        match valid_card {
+            TargetFilter::Typed(tf) => {
+                assert!(
+                    tf.type_filters.contains(&TypeFilter::Creature),
+                    "expected Creature type filter, got {:?}",
+                    tf.type_filters
+                );
+                assert_eq!(
+                    tf.controller,
+                    Some(ControllerRef::You),
+                    "expected controller=You, got {:?}",
+                    tf.controller
+                );
+                assert!(
+                    tf.properties.contains(&FilterProp::Another),
+                    "expected FilterProp::Another in {:?}",
+                    tf.properties
+                );
+            }
+            other => panic!("expected Typed recipient filter, got {other:?}"),
+        }
+
+        // (2) + (3) rider PutCounter targets the event recipient with
+        // EventContextAmount on the `count` field.
+        let execute = def.execute.as_ref().expect("execute present");
+        match &*execute.effect {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } => {
+                assert_eq!(*counter_type, CounterType::Plus1Plus1);
+                assert_eq!(*target, TargetFilter::PostReplacementDamageTarget);
+                // The suffix-form for-each ("... for each 1 damage prevented
+                // this way") lands the prevented amount on the PutCounter
+                // `count` field via `try_parse_for_each_effect`, so pin the
+                // exact field rather than accepting an either/or shape.
+                assert!(
+                    matches!(
+                        count,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::EventContextAmount
+                        }
+                    ),
+                    "expected count to be EventContextAmount; got count={count:?}, repeat_for={:?}",
+                    execute.repeat_for
+                );
+            }
+            other => panic!("expected Effect::PutCounter, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6827,6 +7060,120 @@ mod tests {
         .unwrap();
         assert_eq!(def.event, ReplacementEvent::Moved);
         assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    /// Dragonstorm Globe (#bug): "Each Dragon you control enters with an
+    /// additional +1/+1 counter on it." The bare distributive "each " subject
+    /// (no "other") must produce a typed Dragon filter WITHOUT `FilterProp::Another`
+    /// — per CR 614.12 the general subset includes the source if it matches.
+    /// Previously this fell through to `SelfRef`, so an Artifact source (which is
+    /// never a Dragon) could never match an entering Dragon and the counter was
+    /// never applied. External (non-SelfRef) → ChangeZone so token Dragons also
+    /// receive the counter (CR 614.12).
+    #[test]
+    fn each_distributive_subject_no_another_changezone() {
+        let def = parse_replacement_line(
+            "Each Dragon you control enters with an additional +1/+1 counter on it.",
+            "Dragonstorm Globe",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::ChangeZone);
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Subtype("Dragon".to_string())],
+                controller: Some(ControllerRef::You),
+                // NO FilterProp::Another for the bare "each" distributive form.
+                properties: Vec::new(),
+            })),
+            "bare 'each [type]' must yield a typed filter WITHOUT Another (CR 614.12)"
+        );
+        match *def.execute.as_ref().unwrap().effect {
+            Effect::PutCounter {
+                ref counter_type,
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            } => assert_eq!(*counter_type, CounterType::Plus1Plus1),
+            ref other => panic!("expected PutCounter Fixed(1) Plus1Plus1, got {other:?}"),
+        }
+    }
+
+    /// Regression guard: the explicit "each other " form still injects
+    /// `FilterProp::Another` (excludes the source) per CR 614.12.
+    #[test]
+    fn each_other_subject_keeps_another() {
+        let def = parse_replacement_line(
+            "Each other Angel you control enters with a +1/+1 counter on it.",
+            "Angelic Overseer",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::ChangeZone);
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Subtype("Angel".to_string())],
+                controller: Some(ControllerRef::You),
+                properties: vec![FilterProp::Another],
+            })),
+            "'each other [type]' must keep FilterProp::Another (CR 614.12 excludes source)"
+        );
+    }
+
+    /// Regression guard: a bare "each [non-type]" subject is rejected by the
+    /// concrete-type `.filter()` guard (the word after "each " is not a card
+    /// type), so it falls through to `SelfRef` rather than being mis-redirected
+    /// to a typed distributive filter. This exercises the `Distributive`-scope
+    /// rejection branch that the bare "each " prefix newly reaches.
+    #[test]
+    fn each_non_type_subject_falls_through_to_selfref() {
+        // "each opponent" — "opponent" is not a `TypeFilter` variant, so
+        // `parse_type_phrase` yields the `[Any]` fallback and the subject is
+        // rejected, leaving the self-ETB `SelfRef`/`Moved` result.
+        let def = parse_replacement_line(
+            "Each opponent enters with a +1/+1 counter on it.",
+            "Nonsense Source",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    /// Plain self-ETB ("~ enters with N counters on it") with no subject prefix
+    /// stays `SelfRef`/`Moved` — `parse_distributive_subject` returns `None`.
+    #[test]
+    fn self_etb_no_subject_prefix_stays_selfref() {
+        let def = parse_replacement_line(
+            "This creature enters with two +1/+1 counters on it.",
+            "Generic Creature",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    /// Building-block unit test: `parse_distributive_subject` must report the
+    /// correct `SubjectScope` and strip the prefix, with `"each other "`
+    /// winning over the shorter `"each "` (order-sensitivity contract).
+    #[test]
+    fn parse_distributive_subject_scopes_and_ordering() {
+        assert_eq!(
+            parse_distributive_subject("each other dragon you control enters with"),
+            Some(("dragon you control enters with", SubjectScope::Other)),
+            "'each other ' must win over the shorter 'each ' prefix"
+        );
+        assert_eq!(
+            parse_distributive_subject("other dragon you control enters with"),
+            Some(("dragon you control enters with", SubjectScope::Other)),
+        );
+        assert_eq!(
+            parse_distributive_subject("each dragon you control enters with"),
+            Some(("dragon you control enters with", SubjectScope::Distributive)),
+        );
+        // No distributive prefix → None (self-ETB falls through to SelfRef).
+        assert_eq!(
+            parse_distributive_subject("this creature enters with two counters on it"),
+            None,
+        );
     }
 
     #[test]

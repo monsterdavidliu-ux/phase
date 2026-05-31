@@ -878,6 +878,10 @@ pub(crate) fn extract_amount_from_event(event: &crate::types::events::GameEvent)
         // CR 706.2: the final number of a die roll is its result. Lets
         // `EventContextAmount` resolve "where X is the result" pump effects.
         GameEvent::DieRolled { result, .. } => Some(*result as i32),
+        // CR 120.1 + CR 603.7c: total combat damage dealt to this player by the
+        // matching source set. For DamageDoneOnceByController triggers, this is
+        // the filtered total stamped by matching_damage_done_once_by_controller_event.
+        GameEvent::CombatDamageDealtToPlayer { total_damage, .. } => Some(*total_damage as i32),
         _ => None,
     }
 }
@@ -1410,6 +1414,27 @@ pub(crate) fn latest_tracked_set_id(state: &GameState) -> Option<TrackedSetId> {
         .map(|(&id, _)| id)
 }
 
+/// CR 510.2 + CR 608.2c: In a simultaneous combat-damage event, "those
+/// creatures" on the resolving trigger can refer to the filtered source set
+/// carried by `CombatDamageDealtToPlayer`.
+pub(crate) fn current_combat_damage_source_filter(state: &GameState) -> Option<TargetFilter> {
+    let source_amounts = match state.current_trigger_event.as_ref()? {
+        GameEvent::CombatDamageDealtToPlayer { source_amounts, .. } => source_amounts,
+        _ => return None,
+    };
+
+    match source_amounts.as_slice() {
+        [] => None,
+        [(id, _)] => Some(TargetFilter::SpecificObject { id: *id }),
+        pairs => Some(TargetFilter::Or {
+            filters: pairs
+                .iter()
+                .map(|(id, _)| TargetFilter::SpecificObject { id: *id })
+                .collect(),
+        }),
+    }
+}
+
 /// CR 608.2c: Bind the `TrackedSetId(0)` sentinel in a `TargetFilter` to the
 /// most recent non-empty tracked set.
 ///
@@ -1417,9 +1442,12 @@ pub(crate) fn latest_tracked_set_id(state: &GameState) -> Option<TrackedSetId> {
 /// exiled card") and its type-filtered intersection `TrackedSetFiltered` ("X
 /// cards revealed this way"). Filters that are not sentinel-backed — already
 /// bound tracked-set filters and every non-tracked-set filter — are returned
-/// unchanged. When no tracked set is available the sentinel is left in place so
-/// downstream resolution still sees a (vacuously matching nothing) filter
-/// rather than a silently mismatched concrete id.
+/// unchanged. The active chain-local set wins first; when no chain set is
+/// available, combat-damage trigger context can supply a filtered source set;
+/// otherwise the latest non-empty tracked set is used for legacy callers. If
+/// none of those exists, the sentinel is left in place so downstream resolution
+/// still sees a (vacuously matching nothing) filter rather than a silently
+/// mismatched concrete id.
 ///
 /// This is the single authority for sentinel binding: `ChangeZone` resolution,
 /// chained-ability resolution, and the delayed-trigger / counter / permission
@@ -1432,22 +1460,33 @@ pub(crate) fn resolve_tracked_set_sentinel(
     match filter {
         TargetFilter::TrackedSet {
             id: TrackedSetId(0),
-        } => match latest_tracked_set_id(state) {
-            Some(id) => TargetFilter::TrackedSet { id },
-            None => TargetFilter::TrackedSet {
+        } => state
+            .chain_tracked_set_id
+            .map(|id| TargetFilter::TrackedSet { id })
+            .or_else(|| current_combat_damage_source_filter(state))
+            .or_else(|| latest_tracked_set_id(state).map(|id| TargetFilter::TrackedSet { id }))
+            .unwrap_or(TargetFilter::TrackedSet {
                 id: TrackedSetId(0),
-            },
-        },
+            }),
         TargetFilter::TrackedSetFiltered {
             id: TrackedSetId(0),
             filter,
-        } => match latest_tracked_set_id(state) {
-            Some(id) => TargetFilter::TrackedSetFiltered { id, filter },
-            None => TargetFilter::TrackedSetFiltered {
-                id: TrackedSetId(0),
-                filter,
-            },
-        },
+        } => {
+            if let Some(id) = state.chain_tracked_set_id {
+                TargetFilter::TrackedSetFiltered { id, filter }
+            } else if let Some(source_filter) = current_combat_damage_source_filter(state) {
+                TargetFilter::And {
+                    filters: vec![source_filter, *filter],
+                }
+            } else if let Some(id) = latest_tracked_set_id(state) {
+                TargetFilter::TrackedSetFiltered { id, filter }
+            } else {
+                TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter,
+                }
+            }
+        }
         other => other,
     }
 }
@@ -1463,6 +1502,16 @@ mod tests {
     use crate::types::identifiers::CardId;
     use crate::types::keywords::ProtectionTarget;
     use crate::types::zones::Zone;
+
+    #[test]
+    fn extract_amount_from_combat_damage_dealt_to_player_returns_total_damage() {
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(ObjectId(1), 7)],
+            total_damage: 7,
+        };
+        assert_eq!(extract_amount_from_event(&event), Some(7));
+    }
 
     fn setup_with_creatures() -> (GameState, ObjectId, ObjectId) {
         let mut state = GameState::new_two_player(42);
