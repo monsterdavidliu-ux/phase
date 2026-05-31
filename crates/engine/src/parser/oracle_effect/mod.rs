@@ -2771,6 +2771,13 @@ fn parse_event_context_ref_with_ctx<'a>(
         (TargetFilter::TriggeringPlayer, Some(ControllerRef::ParentTargetController)) => {
             TargetFilter::ParentTargetController
         }
+        // CR 608.2c: After a chosen object target ("choose target permanent …
+        // its controller may … If they don't, deals damage to that player"),
+        // "that player" is the parent target's controller — not the attacking
+        // player (TriggeringPlayer). Star Athlete, Rhystic-style riders, etc.
+        (TargetFilter::TriggeringPlayer, _) if ctx.parent_target_available => {
+            TargetFilter::ParentTargetController
+        }
         _ => target,
     };
     Some((target, rest))
@@ -8831,6 +8838,52 @@ fn rewrite_triggering_spell_controller_to_parent_target_controller(effect: &mut 
     });
 }
 
+/// CR 608.2c: Rewire `DealDamage { target: TriggeringPlayer }` to the parent
+/// target's controller when a prior clause established an object referent.
+fn rewrite_triggering_player_damage_to_parent_controller(effect: &mut Effect) {
+    if let Effect::DealDamage { target, .. } = effect {
+        if matches!(target, TargetFilter::TriggeringPlayer) {
+            *target = TargetFilter::ParentTargetController;
+        }
+    }
+}
+
+fn rewrite_triggering_player_damage_in_clause(clause: &mut ParsedEffectClause) {
+    rewrite_triggering_player_damage_to_parent_controller(&mut clause.effect);
+    let mut cursor = clause.sub_ability.as_deref_mut();
+    while let Some(def) = cursor {
+        rewrite_triggering_player_damage_to_parent_controller(&mut def.effect);
+        cursor = def.sub_ability.as_deref_mut();
+    }
+}
+
+/// CR 608.2c: After lowering, rewire any lingering `DealDamage` to
+/// `TriggeringPlayer` when the chain introduced a typed object target.
+pub(crate) fn rewrite_triggering_player_damage_in_ability(def: &mut AbilityDefinition) {
+    fn walk(def: &mut AbilityDefinition) {
+        if let Effect::DealDamage { target, .. } = &mut *def.effect {
+            if matches!(target, TargetFilter::TriggeringPlayer) {
+                *target = TargetFilter::ParentTargetController;
+            }
+        }
+        if let Some(sub) = def.sub_ability.as_mut() {
+            walk(sub);
+        }
+        if let Some(else_ab) = def.else_ability.as_mut() {
+            walk(else_ab);
+        }
+    }
+    walk(def);
+}
+
+pub(crate) fn effect_chain_ir_had_typed_object_target(
+    clauses: &[crate::parser::oracle_ir::effect_chain::ClauseIr],
+) -> bool {
+    clauses.iter().any(|clause| {
+        !clause.absorbed_by_followup && has_typed_target(&clause.parsed.effect)
+    })
+}
+
 /// Replace the target filter on an effect with ParentTarget.
 /// Used for anaphoric "it"/"that creature" references in compound sub-effects.
 fn replace_target_with_parent(effect: &mut Effect) {
@@ -14258,6 +14311,16 @@ pub(crate) fn parse_effect_chain_ir(
         {
             rewrite_triggering_spell_controller_to_parent_target_controller(&mut clause.effect);
         }
+        // CR 608.2c: "deals N damage to that player" after a chosen object
+        // target must hit that object's controller (Star Athlete), not the
+        // triggering player. `parse_event_context_ref` defaults "that player"
+        // to TriggeringPlayer; this rewrite applies once a typed referent exists
+        // in the chain regardless of per-chunk `parent_target_available`.
+        if chain_has_prior_typed_referent(&clauses)
+            && nom_primitives::scan_contains(&text_lower, "that player")
+        {
+            rewrite_triggering_player_damage_in_clause(&mut clause);
+        }
         // CR 614.1a + CR 701.5 + CR 608.2c: "Exile-after-cast/counter rider"
         // class — Toshiro Umezawa, Dire Fleet Daredevil's chained cousins,
         // Defabricate-class. When the previous clause is a CastFromZone or
@@ -18263,6 +18326,28 @@ mod tests {
             def.duration.is_none(),
             "damage-history target clause must not become a duration: {:?}",
             def.duration
+        );
+    }
+
+    #[test]
+    fn deal_damage_that_player_after_object_target_uses_parent_controller() {
+        let def = parse_effect_chain(
+            "Choose up to one target nonland permanent. Its controller may sacrifice it. If they don't, this creature deals 5 damage to that player.",
+            AbilityKind::Spell,
+        );
+        fn find_damage_target(def: &AbilityDefinition) -> Option<TargetFilter> {
+            if let Effect::DealDamage { target, .. } = &*def.effect {
+                return Some(target.clone());
+            }
+            def.sub_ability
+                .as_ref()
+                .and_then(|sub| find_damage_target(sub))
+        }
+        let target = find_damage_target(&def).expect("expected DealDamage in chain");
+        assert_eq!(
+            target,
+            TargetFilter::ParentTargetController,
+            "that player after a chosen permanent must be ParentTargetController"
         );
     }
 

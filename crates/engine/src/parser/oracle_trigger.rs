@@ -23597,4 +23597,57 @@ mod snapshot_tests {
             other => panic!("expected Or condition, got: {other:?}"),
         }
     }
+
+    fn deal_damage_targets_in_chain(def: &AbilityDefinition) -> Vec<TargetFilter> {
+        let mut out = Vec::new();
+        let mut cur = Some(def);
+        while let Some(d) = cur {
+            if let Effect::DealDamage { target, .. } = &*d.effect {
+                out.push(target.clone());
+            }
+            cur = d.sub_ability.as_deref();
+        }
+        out
+    }
+
+    /// CR 608.2c: "that player" after "choose target permanent … its controller
+    /// may sacrifice it. If they don't, deals 5 damage to that player" must hit
+    /// the chosen permanent's controller, not the attacking player.
+    #[test]
+    fn star_athlete_attack_damage_targets_parent_controller() {
+        let def = parse_trigger_line(
+            "Whenever this creature attacks, choose up to one target nonland permanent. Its controller may sacrifice it. If they don't, this creature deals 5 damage to that player.",
+            "Star Athlete",
+        );
+        let execute = def
+            .execute
+            .as_ref()
+            .expect("attacks trigger must have execute body");
+        let targets = deal_damage_targets_in_chain(execute);
+        assert!(
+            targets
+                .iter()
+                .any(|t| matches!(t, TargetFilter::ParentTargetController)),
+            "expected ParentTargetController on DealDamage, got {targets:?}"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|t| matches!(t, TargetFilter::TriggeringPlayer)),
+            "must not resolve to TriggeringPlayer, got {targets:?}"
+        );
+    }
+
+    /// Guard: event-context "that player" without a prior object target still
+    /// means the triggering player (Eidolon of the Great Revel class).
+    #[test]
+    fn eidolon_that_player_damage_stays_triggering_player() {
+        let def = parse_trigger_line(
+            "Whenever a player casts a spell with mana value 3 or less, this creature deals 2 damage to that player.",
+            "Eidolon of the Great Revel",
+        );
+        let execute = def.execute.as_ref().expect("execute body");
+        let targets = deal_damage_targets_in_chain(execute);
+        assert_eq!(targets, vec![TargetFilter::TriggeringPlayer]);
+    }
 }

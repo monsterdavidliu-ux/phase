@@ -773,6 +773,14 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         result.repeat_until = Some(continuation.clone());
     }
 
+    // CR 608.2c: "deals damage to that player" after a chosen object target
+    // (Star Athlete) must resolve to ParentTargetController. Clause-level
+    // rewrites during IR production cover most paths; this catches nested
+    // sub_ability layouts produced during lowering.
+    if super::effect_chain_ir_had_typed_object_target(&ir.clauses) {
+        super::rewrite_triggering_player_damage_in_ability(&mut result);
+    }
+
     result
 }
 
